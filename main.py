@@ -15,10 +15,6 @@ import asyncio
 import logging
 from sqlalchemy.pool import NullPool
 from mangum import Mangum
-from dotenv import load_dotenv
-
-# ---------- LOAD ENV ----------
-# load_dotenv()
 
 # ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO)
@@ -129,13 +125,12 @@ def validate_category(cat: str):
         raise HTTPException(400, f"Invalid category: {cat}")
     return cat
 
-# ---------- DB UTIL ----------
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
     logger.info("Database tables created successfully!")
 
 # ---------- APP ----------
-app = FastAPI(title="AnimePixels API", version="3.8")
+app = FastAPI(title="AnimePixels API", version="4.0")
 handler = Mangum(app)
 
 app.add_middleware(
@@ -274,51 +269,60 @@ def get_gif(media_id: int, session: Session = Depends(get_session)):
     return media
 
 # ---------- BY CATEGORY ----------
-@app.get("/images/category/{category}", response_model=PaginatedMedia)
-def images_by_category(category: str, page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
-    category = validate_category(category)
-    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.category==category, Media.media_type=="image")).one()
+def paginated_query(session: Session, media_type: str, category: str, page: int, limit: int):
+    total_items = session.exec(
+        select(func.count(Media.id)).where(
+            Media.visible==True, Media.category==category, Media.media_type==media_type
+        )
+    ).one()
     total_items = total_items[0] if isinstance(total_items, tuple) else total_items
     total_pages = (total_items + limit - 1)//limit
     if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
     offset = (page-1)*limit
-    items = session.exec(select(Media).where(Media.visible==True, Media.category==category, Media.media_type=="image").offset(offset).limit(limit)).all()
+    items = session.exec(
+        select(Media).where(
+            Media.visible==True, Media.category==category, Media.media_type==media_type
+        ).offset(offset).limit(limit)
+    ).all()
     for m in items: increment_views(m, session)
     return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
+
+@app.get("/images/category/{category}", response_model=PaginatedMedia)
+def images_by_category(category: str, page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
+    category = validate_category(category)
+    return paginated_query(session, "image", category, page, limit)
 
 @app.get("/gifs/category/{category}", response_model=PaginatedMedia)
 def gifs_by_category(category: str, page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
     category = validate_category(category)
-    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.category==category, Media.media_type=="gif")).one()
+    return paginated_query(session, "gif", category, page, limit)
+
+# ---------- SEARCH ----------
+def search_query(session: Session, media_type: str, q: str, page: int, limit: int):
+    pattern = f"%{q.lower()}%"
+    total_items = session.exec(
+        select(func.count(Media.id)).where(
+            Media.visible==True, Media.media_type==media_type,
+            (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))
+        )
+    ).one()
     total_items = total_items[0] if isinstance(total_items, tuple) else total_items
     total_pages = (total_items + limit - 1)//limit
     if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
     offset = (page-1)*limit
-    items = session.exec(select(Media).where(Media.visible==True, Media.category==category, Media.media_type=="gif").offset(offset).limit(limit)).all()
+    items = session.exec(
+        select(Media).where(
+            Media.visible==True, Media.media_type==media_type,
+            (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))
+        ).offset(offset).limit(limit)
+    ).all()
     for m in items: increment_views(m, session)
     return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
 
-# ---------- SEARCH ----------
 @app.get("/search/images", response_model=PaginatedMedia)
 def search_images(q: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
-    pattern = f"%{q.lower()}%"
-    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.media_type=="image", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern)))).one()
-    total_items = total_items[0] if isinstance(total_items, tuple) else total_items
-    total_pages = (total_items + limit - 1)//limit
-    if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
-    offset = (page-1)*limit
-    items = session.exec(select(Media).where(Media.visible==True, Media.media_type=="image", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))).offset(offset).limit(limit)).all()
-    for m in items: increment_views(m, session)
-    return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
+    return search_query(session, "image", q, page, limit)
 
 @app.get("/search/gifs", response_model=PaginatedMedia)
 def search_gifs(q: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
-    pattern = f"%{q.lower()}%"
-    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.media_type=="gif", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern)))).one()
-    total_items = total_items[0] if isinstance(total_items, tuple) else total_items
-    total_pages = (total_items + limit - 1)//limit
-    if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
-    offset = (page-1)*limit
-    items = session.exec(select(Media).where(Media.visible==True, Media.media_type=="gif", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))).offset(offset).limit(limit)).all()
-    for m in items: increment_views(m, session)
-    return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
+    return search_query(session, "gif", q, page, limit)
