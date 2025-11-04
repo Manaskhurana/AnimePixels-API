@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import cloudinary
 import cloudinary.uploader
 import logging
+from mangum import Mangum
 
 # -----------------------
 # Logging
@@ -650,3 +651,8 @@ def health(session: Session = Depends(get_session)):
             "database": "disconnected",
             "error": str(e)
         }
+
+# -----------------------
+# Mangum handler for Vercel serverless
+# -----------------------
+handler = Mangum(app)
