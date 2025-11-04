@@ -1,19 +1,16 @@
-# main.py
 import os
 import random
 import jwt
-import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, AsyncGenerator
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Form, Depends, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import SQLModel, Field as SQLField, select, func
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 import cloudinary
 import cloudinary.uploader
 
@@ -26,7 +23,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
@@ -42,14 +39,30 @@ cloudinary.config(
     secure=True
 )
 
-# ---------- DATABASE ----------
-engine = create_async_engine(DATABASE_URL, echo=False, future=True)
-async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+# ---------- DATABASE ENGINE ----------
+# Use smaller pool sizes for serverless
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,
+    pool_size=1,  # Minimal pool for serverless
+    max_overflow=0,  # No overflow
+    pool_recycle=3600,  # Recycle connections after 1 hour
+    connect_args={
+        "server_settings": {"application_name": "animepixels_api"},
+        "timeout": 30,
+        "command_timeout": 30,
+    }
+)
 
-# ---------- ASYNC SESSION DEPENDENCY ----------
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session() as session:
-        yield session
+async_session_maker = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+    autocommit=False
+)
 
 # ---------- MODELS ----------
 class Media(SQLModel, table=True):
@@ -101,6 +114,15 @@ ALLOWED_CATEGORIES = {
     "pokemon", "spy_x_family", "solo_leveling", "nature", "popular_anime"
 }
 
+# ---------- ASYNC SESSION DEPENDENCY ----------
+async def get_session():
+    """Get database session for each request"""
+    async with async_session_maker() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
 # ---------- AUTH ----------
 security = HTTPBearer(auto_error=False)
 
@@ -129,6 +151,7 @@ def validate_category(cat: str):
     return cat
 
 async def create_db_and_tables():
+    """Initialize database tables"""
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
     logger.info("Database tables created successfully!")
@@ -146,22 +169,26 @@ app.add_middleware(
 
 # ---------- HELPERS ----------
 async def increment_views(media: Media, session: AsyncSession):
+    """Increment view count for media"""
     media.views += 1
     media.updated_at = datetime.utcnow()
     session.add(media)
     await session.commit()
+    await session.refresh(media)
 
 # ---------- ROUTES ----------
 @app.get("/")
 def home():
-    return {"message": "✅ AnimePixels API is running!"}
+    return {"message": "✅ AnimePixels API is running!", "status": "ok"}
 
 @app.get("/health")
 async def health(session: AsyncSession = Depends(get_session)):
     try:
-        await session.execute(select(1))
-        return {"status": "ok", "database": "connected"}
+        result = await session.execute(select(func.count(Media.id)))
+        count = result.scalar_one()
+        return {"status": "ok", "database": "connected", "media_count": count}
     except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
         return {"status": "error", "database": "disconnected", "error": str(e)}
 
 @app.post("/login")
@@ -172,15 +199,27 @@ def login(username: str = Form(...), password: str = Form(...)):
 
 @app.get("/admin/init-db")
 async def init_db(admin: dict = Depends(verify_admin)):
-    await create_db_and_tables()
-    return {"status": "success", "message": "Database tables created successfully"}
+    try:
+        await create_db_and_tables()
+        return {"status": "success", "message": "Database tables created successfully"}
+    except Exception as e:
+        logger.error(f"Database initialization failed: {str(e)}")
+        raise HTTPException(500, f"Failed to initialize database: {str(e)}")
 
 @app.get("/admin/stats")
 async def get_stats(admin: dict = Depends(verify_admin), session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(Media))
-    all_media = result.scalars().all()
-    total_views = sum([m.views for m in all_media])
-    return {"total_media": len(all_media), "total_views": total_views}
+    try:
+        result = await session.execute(select(Media))
+        all_media = result.scalars().all()
+        total_views = sum([m.views for m in all_media])
+        return {
+            "total_media": len(all_media),
+            "total_views": total_views,
+            "categories": list(ALLOWED_CATEGORIES)
+        }
+    except Exception as e:
+        logger.error(f"Stats retrieval failed: {str(e)}")
+        raise HTTPException(500, f"Failed to retrieve stats: {str(e)}")
 
 @app.post("/admin/bulk-upload", response_model=BulkUploadResponse)
 async def bulk_upload(
@@ -202,15 +241,20 @@ async def bulk_upload(
         try:
             title = titles[idx].strip()
             category = validate_category(categories[idx])
-            upload = await asyncio.to_thread(
-                cloudinary.uploader.upload,
-                file.file,
+            
+            # Read file content
+            file_content = await file.read()
+            
+            # Upload to Cloudinary
+            upload = cloudinary.uploader.upload(
+                file_content,
                 resource_type="image",
                 folder=f"animepixels/{category}",
                 use_filename=True,
                 unique_filename=True,
-                timeout=60
+                timeout=30  # Reduced timeout for serverless
             )
+            
             media = Media(
                 title=title,
                 category=category,
@@ -220,6 +264,8 @@ async def bulk_upload(
             )
             session.add(media)
             await session.commit()
+            await session.refresh(media)
+            
             uploaded.append(
                 UploadedMediaItem(
                     filename=file.filename,
@@ -229,28 +275,42 @@ async def bulk_upload(
                 )
             )
         except Exception as e:
+            logger.error(f"Upload failed for {file.filename}: {str(e)}")
             errors.append({"filename": file.filename, "error": str(e)})
             await session.rollback()
         finally:
             await file.close()
 
-    return BulkUploadResponse(success=len(uploaded), failed=len(errors), uploaded_media=uploaded, errors=errors)
+    return BulkUploadResponse(
+        success=len(uploaded),
+        failed=len(errors),
+        uploaded_media=uploaded,
+        errors=errors
+    )
 
 # ---------- RANDOM ----------
 @app.get("/random/image", response_model=MediaOut)
 async def random_image(session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(Media.id).where(Media.visible==True, Media.media_type=="image"))
+    result = await session.execute(
+        select(Media.id).where(Media.visible == True, Media.media_type == "image")
+    )
     ids = result.scalars().all()
-    if not ids: raise HTTPException(404, "No images available")
+    if not ids:
+        raise HTTPException(404, "No images available")
+    
     media = await session.get(Media, random.choice(ids))
     await increment_views(media, session)
     return media
 
 @app.get("/random/gif", response_model=MediaOut)
 async def random_gif(session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(Media.id).where(Media.visible==True, Media.media_type=="gif"))
+    result = await session.execute(
+        select(Media.id).where(Media.visible == True, Media.media_type == "gif")
+    )
     ids = result.scalars().all()
-    if not ids: raise HTTPException(404, "No gifs available")
+    if not ids:
+        raise HTTPException(404, "No gifs available")
+    
     media = await session.get(Media, random.choice(ids))
     await increment_views(media, session)
     return media
@@ -273,21 +333,43 @@ async def get_gif(media_id: int, session: AsyncSession = Depends(get_session)):
     return media
 
 # ---------- CATEGORY & SEARCH ----------
-async def paginated_query(session: AsyncSession, media_type: str, category: str, page: int, limit: int):
-    result = await session.execute(select(func.count(Media.id)).where(
-        Media.visible==True, Media.category==category, Media.media_type==media_type
-    ))
+async def paginated_query(
+    session: AsyncSession,
+    media_type: str,
+    category: str,
+    page: int,
+    limit: int
+):
+    result = await session.execute(
+        select(func.count(Media.id)).where(
+            Media.visible == True,
+            Media.category == category,
+            Media.media_type == media_type
+        )
+    )
     total_items = result.scalar_one()
-    total_pages = (total_items + limit - 1)//limit
-    if page > total_pages and total_pages > 0:
+    total_pages = max(1, (total_items + limit - 1) // limit)
+    
+    if page > total_pages and total_items > 0:
         raise HTTPException(404, f"Page {page} does not exist")
-    offset = (page-1)*limit
-    result = await session.execute(select(Media).where(
-        Media.visible==True, Media.category==category, Media.media_type==media_type
-    ).offset(offset).limit(limit))
+    
+    offset = (page - 1) * limit
+    result = await session.execute(
+        select(Media).where(
+            Media.visible == True,
+            Media.category == category,
+            Media.media_type == media_type
+        ).offset(offset).limit(limit)
+    )
     items = result.scalars().all()
+    
+    # Increment views in bulk
     for m in items:
-        await increment_views(m, session)
+        m.views += 1
+        m.updated_at = datetime.utcnow()
+        session.add(m)
+    await session.commit()
+    
     return PaginatedMedia(
         page=page,
         limit=limit,
@@ -296,24 +378,44 @@ async def paginated_query(session: AsyncSession, media_type: str, category: str,
         items=[MediaOut.model_validate(m) for m in items]
     )
 
-async def search_query(session: AsyncSession, media_type: str, q: str, page: int, limit: int):
+async def search_query(
+    session: AsyncSession,
+    media_type: str,
+    q: str,
+    page: int,
+    limit: int
+):
     pattern = f"%{q.lower()}%"
-    result = await session.execute(select(func.count(Media.id)).where(
-        Media.visible==True, Media.media_type==media_type,
-        (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))
-    ))
+    result = await session.execute(
+        select(func.count(Media.id)).where(
+            Media.visible == True,
+            Media.media_type == media_type,
+            (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))
+        )
+    )
     total_items = result.scalar_one()
-    total_pages = (total_items + limit - 1)//limit
-    if page > total_pages and total_pages > 0:
+    total_pages = max(1, (total_items + limit - 1) // limit)
+    
+    if page > total_pages and total_items > 0:
         raise HTTPException(404, f"Page {page} does not exist")
-    offset = (page-1)*limit
-    result = await session.execute(select(Media).where(
-        Media.visible==True, Media.media_type==media_type,
-        (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))
-    ).offset(offset).limit(limit))
+    
+    offset = (page - 1) * limit
+    result = await session.execute(
+        select(Media).where(
+            Media.visible == True,
+            Media.media_type == media_type,
+            (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))
+        ).offset(offset).limit(limit)
+    )
     items = result.scalars().all()
+    
+    # Increment views in bulk
     for m in items:
-        await increment_views(m, session)
+        m.views += 1
+        m.updated_at = datetime.utcnow()
+        session.add(m)
+    await session.commit()
+    
     return PaginatedMedia(
         page=page,
         limit=limit,
@@ -323,23 +425,42 @@ async def search_query(session: AsyncSession, media_type: str, q: str, page: int
     )
 
 @app.get("/images/category/{category}", response_model=PaginatedMedia)
-async def images_by_category(category: str, page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100),
-                             session: AsyncSession = Depends(get_session)):
+async def images_by_category(
+    category: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session)
+):
     category = validate_category(category)
     return await paginated_query(session, "image", category, page, limit)
 
 @app.get("/gifs/category/{category}", response_model=PaginatedMedia)
-async def gifs_by_category(category: str, page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100),
-                           session: AsyncSession = Depends(get_session)):
+async def gifs_by_category(
+    category: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session)
+):
     category = validate_category(category)
     return await paginated_query(session, "gif", category, page, limit)
 
 @app.get("/search/images", response_model=PaginatedMedia)
-async def search_images(q: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100),
-                        session: AsyncSession = Depends(get_session)):
+async def search_images(
+    q: str = Query(...),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session)
+):
     return await search_query(session, "image", q, page, limit)
 
 @app.get("/search/gifs", response_model=PaginatedMedia)
-async def search_gifs(q: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100),
-                      session: AsyncSession = Depends(get_session)):
+async def search_gifs(
+    q: str = Query(...),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session)
+):
     return await search_query(session, "gif", q, page, limit)
+
+# Export for Vercel
+handler = app
