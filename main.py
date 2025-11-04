@@ -18,7 +18,7 @@ from mangum import Mangum
 from dotenv import load_dotenv
 
 # ---------- LOAD ENV ----------
-load_dotenv()
+# load_dotenv()
 
 # ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO)
