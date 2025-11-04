@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, HTTPException, Form, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -100,10 +99,22 @@ class BulkUploadResponse(BaseModel):
     errors: List[dict]
 
 # ---------- STARTUP & SHUTDOWN ----------
+def create_db_and_tables():
+    """Create database tables"""
+    try:
+        logger.info("Creating database tables...")
+        SQLModel.metadata.create_all(engine)
+        logger.info("✓ Database tables created successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"✗ Error creating database tables: {e}")
+        return False
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     logger.info("Starting up...")
+    create_db_and_tables()
     yield
     logger.info("Shutting down...")
 
@@ -170,7 +181,15 @@ def validate_category(cat: str):
         raise HTTPException(400, f"Invalid category: {cat}")
     return cat
 
-
+# ---------- ADMIN ENDPOINTS ----------
+@app.get("/admin/init-db")
+def init_db(admin: dict = Depends(verify_admin)):
+    """Initialize/create database tables - Call this once"""
+    success = create_db_and_tables()
+    if success:
+        return {"status": "success", "message": "Database tables created successfully"}
+    else:
+        raise HTTPException(500, "Failed to create database tables")
 
 @app.get("/admin/stats")
 def get_stats(admin: dict = Depends(verify_admin), session: Session = Depends(get_session)):
@@ -275,7 +294,8 @@ async def bulk_upload(
             
             category = validate_category(category)
             
-            logger.info(f"Uploading: {file.filename}")
+            contents = await file.read()
+            logger.info(f"Uploading: {file.filename} ({len(contents)} bytes)")
             
             resource_type = "image"
             
@@ -293,7 +313,7 @@ async def bulk_upload(
             
             logger.info(f"Upload params: resource_type={resource_type}, format={upload_params.get('format', 'auto')}")
             
-            upload_result = cloudinary.uploader.upload(file.file, **upload_params)
+            upload_result = cloudinary.uploader.upload(contents, **upload_params)
             
             logger.info(f"Cloudinary upload successful: {upload_result['secure_url']}")
             
@@ -342,7 +362,8 @@ async def bulk_upload(
             })
             session.rollback()
         
-
+        finally:
+            await file.close()
     
     return BulkUploadResponse(
         success=success_count,
