@@ -4,7 +4,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import SQLModel, Field as SQLField, Session, create_engine, select
 from typing import Optional, List
-from contextlib import asynccontextmanager
 import os
 import random
 import jwt
@@ -22,7 +21,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set in environment")
 
-# Ensure SSL for Neon or similar DBs
 if "sslmode" not in DATABASE_URL:
     DATABASE_URL += "&sslmode=require" if "?" in DATABASE_URL else "?sslmode=require"
 
@@ -120,21 +118,14 @@ def validate_category(cat: str):
         raise HTTPException(400, f"Invalid category: {cat}")
     return cat
 
-# ---------- STARTUP ----------
+# ---------- DB UTIL ----------
 def create_db_and_tables():
     engine = get_engine()
     SQLModel.metadata.create_all(engine)
     logger.info("✓ Database tables created successfully!")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting up...")
-    create_db_and_tables()
-    yield
-    logger.info("Shutting down...")
-
 # ---------- APP ----------
-app = FastAPI(title="AnimePixels API", version="3.1", lifespan=lifespan)
+app = FastAPI(title="AnimePixels API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
