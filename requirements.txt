@@ -8,4 +8,3 @@ PyJWT
 requests
 python-multipart
 mangum
-
