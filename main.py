@@ -10,58 +10,78 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import SQLModel, Field as SQLField, select, func
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 import cloudinary
 import cloudinary.uploader
 
 # ---------- LOGGING ----------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# ---------- ENV ----------
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-
-# Fix postgres:// scheme for asyncpg
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif not DATABASE_URL.startswith("postgresql"):
-    raise RuntimeError("DATABASE_URL must be PostgreSQL")
-
-logger.info(f"Database URL format: {DATABASE_URL[:40]}...")
-
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
-JWT_SECRET = os.getenv("JWT_SECRET_KEY", "change-me")
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+try:
+    logger.info("Starting AnimePixels API initialization...")
+    
+    # ---------- ENV ----------
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+    
+    logger.info(f"DATABASE_URL found: {DATABASE_URL[:50]}...")
+    
+    # Fix postgres:// scheme for asyncpg
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+        logger.info("Converted postgres:// to postgresql+asyncpg://")
+    
+    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
+    JWT_SECRET = os.getenv("JWT_SECRET_KEY", "change-me")
+    JWT_ALGORITHM = "HS256"
+    JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+    
+    logger.info("Environment variables loaded successfully")
+    
+except Exception as e:
+    logger.error(f"Failed to load environment variables: {str(e)}", exc_info=True)
+    raise
 
 # ---------- CLOUDINARY ----------
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-    secure=True
-)
+try:
+    cloudinary.config(
+        cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+        api_key=os.getenv("CLOUDINARY_API_KEY"),
+        api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+        secure=True
+    )
+    logger.info("Cloudinary configured successfully")
+except Exception as e:
+    logger.error(f"Cloudinary configuration failed: {str(e)}", exc_info=True)
 
-# ---------- DATABASE ENGINE (Serverless-optimized) ----------
-# NO connection pooling for serverless - create new connection per request
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    future=True,
-    # Disable pooling for serverless
-    poolclass=None,
-    connect_args={
-        "timeout": 15,
-        "command_timeout": 15,
-        "server_settings": {"application_name": "animepixels_api"},
-    }
-)
+# ---------- DATABASE ENGINE (No Pooling for Vercel) ----------
+try:
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        future=True,
+        # Disable pooling entirely for serverless
+        pool_size=0,
+        max_overflow=0,
+        connect_args={
+            "timeout": 10,
+            "command_timeout": 10,
+            "server_settings": {"application_name": "animepixels_api"},
+        }
+    )
+    logger.info("Database engine created successfully")
+except Exception as e:
+    logger.error(f"Failed to create database engine: {str(e)}", exc_info=True)
+    raise
 
-# Use sessionmaker without pool
+# Use sessionmaker without pooling
 async_session = sessionmaker(
     engine,
     class_=AsyncSession,
@@ -122,17 +142,22 @@ ALLOWED_CATEGORIES = {
 
 # ---------- ASYNC SESSION DEPENDENCY ----------
 async def get_session():
-    """Get database session - creates new connection per request for serverless"""
-    async with async_session() as session:
-        try:
-            # Test connection
-            await session.execute(select(1))
-            yield session
-        except Exception as e:
-            logger.error(f"Database connection failed: {str(e)}")
-            raise HTTPException(500, f"Database connection failed: {str(e)}")
-        finally:
-            await session.close()
+    """Get database session - fresh connection per request"""
+    session = None
+    try:
+        session = async_session()
+        logger.debug("Database session created")
+        yield session
+    except Exception as e:
+        logger.error(f"Database session error: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if session:
+            try:
+                await session.close()
+                logger.debug("Database session closed")
+            except Exception as e:
+                logger.error(f"Error closing session: {str(e)}")
 
 # ---------- AUTH ----------
 security = HTTPBearer(auto_error=False)
@@ -144,15 +169,19 @@ def create_jwt_token(data: dict):
 
 def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials:
+        logger.warning("Admin request without token")
         raise HTTPException(401, "Missing token")
     try:
         data = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if not data.get("is_admin"):
+            logger.warning("Non-admin token used for admin endpoint")
             raise HTTPException(403, "Unauthorized")
         return data
     except jwt.ExpiredSignatureError:
+        logger.warning("Expired token used")
         raise HTTPException(401, "Token expired")
-    except jwt.InvalidTokenError:
+    except jwt.InvalidTokenError as e:
+        logger.warning(f"Invalid token: {str(e)}")
         raise HTTPException(401, "Invalid token")
 
 def validate_category(cat: str):
@@ -162,13 +191,13 @@ def validate_category(cat: str):
     return cat
 
 async def create_db_and_tables():
-    """Initialize database tables - run this once manually"""
+    """Initialize database tables"""
     try:
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
         logger.info("Database tables created successfully!")
     except Exception as e:
-        logger.error(f"Failed to create tables: {str(e)}")
+        logger.error(f"Failed to create tables: {str(e)}", exc_info=True)
         raise
 
 # ---------- APP ----------
@@ -182,6 +211,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger.info("FastAPI app initialized successfully")
+
 # ---------- HELPERS ----------
 async def increment_views(media: Media, session: AsyncSession):
     """Increment view count for media"""
@@ -190,6 +221,7 @@ async def increment_views(media: Media, session: AsyncSession):
         media.updated_at = datetime.utcnow()
         session.add(media)
         await session.commit()
+        logger.debug(f"Views incremented for media {media.id}")
     except Exception as e:
         logger.error(f"Failed to increment views: {str(e)}")
         await session.rollback()
@@ -197,61 +229,86 @@ async def increment_views(media: Media, session: AsyncSession):
 # ---------- ROUTES ----------
 @app.get("/")
 def home():
-    return {"message": "✅ AnimePixels API is running!", "status": "ok", "version": "5.0"}
+    logger.info("Home endpoint accessed")
+    return {
+        "message": "✅ AnimePixels API is running!",
+        "status": "ok",
+        "version": "5.0"
+    }
 
 @app.get("/health")
 async def health(session: AsyncSession = Depends(get_session)):
     """Health check endpoint"""
     try:
+        logger.info("Health check initiated")
         result = await session.execute(select(func.count(Media.id)))
         count = result.scalar_one_or_none() or 0
-        return {"status": "ok", "database": "connected", "media_count": count}
+        logger.info(f"Health check passed. Media count: {count}")
+        return {
+            "status": "ok",
+            "database": "connected",
+            "media_count": count
+        }
     except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        raise HTTPException(500, f"Database health check failed: {str(e)}")
+        logger.error(f"Health check failed: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"Health check failed: {str(e)}")
 
 @app.post("/login")
 def login(username: str = Form(...), password: str = Form(...)):
     """Admin login endpoint"""
+    logger.info(f"Login attempt for user: {username}")
     if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
+        logger.warning(f"Failed login attempt for user: {username}")
         raise HTTPException(401, "Invalid login")
     token = create_jwt_token({"sub": username, "is_admin": True})
+    logger.info(f"Successful login for user: {username}")
     return {"token": token, "expires_in": JWT_EXPIRE_MINUTES * 60}
 
 @app.get("/admin/init-db")
 async def init_db(admin: dict = Depends(verify_admin)):
     """Initialize database tables - call this once after deployment"""
     try:
+        logger.info("Database initialization requested")
         await create_db_and_tables()
-        return {"status": "success", "message": "Database tables created successfully"}
+        logger.info("Database initialization completed")
+        return {
+            "status": "success",
+            "message": "Database tables created successfully"
+        }
     except Exception as e:
-        logger.error(f"Database initialization failed: {str(e)}")
+        logger.error(f"Database initialization failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to initialize database: {str(e)}")
 
 @app.get("/admin/stats")
 async def get_stats(admin: dict = Depends(verify_admin), session: AsyncSession = Depends(get_session)):
     """Get statistics about media"""
     try:
+        logger.info("Stats endpoint accessed")
         result = await session.execute(select(Media))
         all_media = result.scalars().all()
         total_views = sum([m.views for m in all_media])
         
-        # Count by media type
-        result_images = await session.execute(select(func.count(Media.id)).where(Media.media_type == "image"))
+        result_images = await session.execute(
+            select(func.count(Media.id)).where(Media.media_type == "image")
+        )
         image_count = result_images.scalar_one_or_none() or 0
         
-        result_gifs = await session.execute(select(func.count(Media.id)).where(Media.media_type == "gif"))
+        result_gifs = await session.execute(
+            select(func.count(Media.id)).where(Media.media_type == "gif")
+        )
         gif_count = result_gifs.scalar_one_or_none() or 0
         
-        return {
+        stats = {
             "total_media": len(all_media),
             "total_images": image_count,
             "total_gifs": gif_count,
             "total_views": total_views,
             "categories": sorted(list(ALLOWED_CATEGORIES))
         }
+        logger.info(f"Stats retrieved: {stats}")
+        return stats
     except Exception as e:
-        logger.error(f"Stats retrieval failed: {str(e)}")
+        logger.error(f"Stats retrieval failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to retrieve stats: {str(e)}")
 
 @app.post("/admin/bulk-upload", response_model=BulkUploadResponse)
@@ -264,9 +321,13 @@ async def bulk_upload(
     session: AsyncSession = Depends(get_session)
 ):
     """Bulk upload media files"""
+    logger.info(f"Bulk upload initiated: {len(files)} files, type: {media_type}")
+    
     if len(files) > 50:
+        logger.warning(f"Bulk upload rejected: too many files ({len(files)})")
         raise HTTPException(400, "Maximum 50 files allowed per upload")
     if media_type not in ["image", "gif"]:
+        logger.warning(f"Bulk upload rejected: invalid media_type ({media_type})")
         raise HTTPException(400, "media_type must be 'image' or 'gif'")
 
     uploaded, errors = [], []
@@ -278,6 +339,7 @@ async def bulk_upload(
             
             title = titles[idx].strip()
             category = validate_category(categories[idx])
+            logger.info(f"Uploading file {idx+1}/{len(files)}: {file.filename}")
             
             # Read file content
             file_content = await file.read()
@@ -311,13 +373,15 @@ async def bulk_upload(
                     media=MediaOut.model_validate(media)
                 )
             )
+            logger.info(f"Successfully uploaded: {file.filename}")
         except Exception as e:
-            logger.error(f"Upload failed for {file.filename}: {str(e)}")
+            logger.error(f"Upload failed for {file.filename}: {str(e)}", exc_info=True)
             errors.append({"filename": file.filename, "error": str(e)})
             await session.rollback()
         finally:
             await file.close()
 
+    logger.info(f"Bulk upload completed: {len(uploaded)} succeeded, {len(errors)} failed")
     return BulkUploadResponse(
         success=len(uploaded),
         failed=len(errors),
@@ -335,16 +399,19 @@ async def random_image(session: AsyncSession = Depends(get_session)):
         )
         ids = result.scalars().all()
         if not ids:
+            logger.warning("No images available")
             raise HTTPException(404, "No images available")
         
-        media = await session.get(Media, random.choice(ids))
+        media_id = random.choice(ids)
+        media = await session.get(Media, media_id)
         if media:
             await increment_views(media, session)
+        logger.info(f"Random image retrieved: {media_id}")
         return media
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Random image fetch failed: {str(e)}")
+        logger.error(f"Random image fetch failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to fetch random image: {str(e)}")
 
 @app.get("/random/gif", response_model=MediaOut)
@@ -356,16 +423,19 @@ async def random_gif(session: AsyncSession = Depends(get_session)):
         )
         ids = result.scalars().all()
         if not ids:
+            logger.warning("No gifs available")
             raise HTTPException(404, "No gifs available")
         
-        media = await session.get(Media, random.choice(ids))
+        media_id = random.choice(ids)
+        media = await session.get(Media, media_id)
         if media:
             await increment_views(media, session)
+        logger.info(f"Random gif retrieved: {media_id}")
         return media
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Random gif fetch failed: {str(e)}")
+        logger.error(f"Random gif fetch failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to fetch random gif: {str(e)}")
 
 # ---------- GET BY ID ----------
@@ -375,13 +445,14 @@ async def get_image(media_id: int, session: AsyncSession = Depends(get_session))
     try:
         media = await session.get(Media, media_id)
         if not media or media.media_type != "image" or not media.visible:
+            logger.warning(f"Image not found: {media_id}")
             raise HTTPException(404, "Image not found")
         await increment_views(media, session)
         return media
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Get image failed: {str(e)}")
+        logger.error(f"Get image failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to fetch image: {str(e)}")
 
 @app.get("/gif/{media_id}", response_model=MediaOut)
@@ -390,13 +461,14 @@ async def get_gif(media_id: int, session: AsyncSession = Depends(get_session)):
     try:
         media = await session.get(Media, media_id)
         if not media or media.media_type != "gif" or not media.visible:
+            logger.warning(f"Gif not found: {media_id}")
             raise HTTPException(404, "Gif not found")
         await increment_views(media, session)
         return media
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Get gif failed: {str(e)}")
+        logger.error(f"Get gif failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to fetch gif: {str(e)}")
 
 # ---------- CATEGORY & SEARCH ----------
@@ -420,6 +492,7 @@ async def paginated_query(
         total_pages = max(1, (total_items + limit - 1) // limit)
         
         if page > total_pages and total_items > 0:
+            logger.warning(f"Page {page} out of range (max: {total_pages})")
             raise HTTPException(404, f"Page {page} does not exist")
         
         offset = (page - 1) * limit
@@ -439,6 +512,7 @@ async def paginated_query(
             session.add(m)
         await session.commit()
         
+        logger.info(f"Paginated query: {category}, {media_type}, page {page}")
         return PaginatedMedia(
             page=page,
             limit=limit,
@@ -449,7 +523,7 @@ async def paginated_query(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Paginated query failed: {str(e)}")
+        logger.error(f"Paginated query failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to fetch paginated results: {str(e)}")
 
 async def search_query(
@@ -473,6 +547,7 @@ async def search_query(
         total_pages = max(1, (total_items + limit - 1) // limit)
         
         if page > total_pages and total_items > 0:
+            logger.warning(f"Search page {page} out of range (max: {total_pages})")
             raise HTTPException(404, f"Page {page} does not exist")
         
         offset = (page - 1) * limit
@@ -492,6 +567,7 @@ async def search_query(
             session.add(m)
         await session.commit()
         
+        logger.info(f"Search query: '{q}', {media_type}, page {page}, results: {len(items)}")
         return PaginatedMedia(
             page=page,
             limit=limit,
@@ -502,7 +578,7 @@ async def search_query(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Search query failed: {str(e)}")
+        logger.error(f"Search query failed: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to search: {str(e)}")
 
 @app.get("/images/category/{category}", response_model=PaginatedMedia)
@@ -549,3 +625,5 @@ async def search_gifs(
 
 # Export for Vercel
 handler = app
+
+logger.info("✅ AnimePixels API ready for deployment")
