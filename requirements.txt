@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlmodel
+psycopg2-binary
+cloudinary
+python-dotenv
+PyJWT
+requests
+python-multipart

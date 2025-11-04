@@ -1,0 +1,12 @@
+[project]
+name = "animepixels"
+version = "0.1.0"
+description = "AnimePixels API Python Client"
+authors = [{ name="Manas"}]
+dependencies = ["requests"]
+requires-python = ">=3.8"
+readme = "README.md"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
