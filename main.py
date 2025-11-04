@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Form, Depends, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,6 +15,10 @@ import asyncio
 import logging
 from sqlalchemy.pool import NullPool
 from mangum import Mangum
+from dotenv import load_dotenv
+
+# ---------- LOAD ENV ----------
+load_dotenv()
 
 # ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO)
@@ -130,8 +135,8 @@ def create_db_and_tables():
     logger.info("Database tables created successfully!")
 
 # ---------- APP ----------
-app = FastAPI(title="AnimePixels API", version="3.6")
-handler = Mangum(app)  # Vercel serverless handler
+app = FastAPI(title="AnimePixels API", version="3.8")
+handler = Mangum(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -141,17 +146,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- HELPER ----------
+def increment_views(media: Media, session: Session):
+    media.views += 1
+    media.updated_at = datetime.utcnow()
+    session.add(media)
+    session.commit()
+
 # ---------- ROUTES ----------
 @app.get("/")
 def home():
     return {"message": "✅ AnimePixels API is running!"}
 
+@app.get("/health")
+def health(session: Session = Depends(get_session)):
+    try:
+        session.exec(select(1))
+        return {"status": "ok", "database": "connected"}
+    except Exception as e:
+        return {"status": "error", "database": "disconnected", "error": str(e)}
+
+# ---------- AUTH ----------
 @app.post("/login")
 def login(username: str = Form(...), password: str = Form(...)):
     if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
         raise HTTPException(401, "Invalid login")
     return {"token": create_jwt_token({"sub": username, "is_admin": True})}
 
+# ---------- ADMIN ----------
 @app.get("/admin/init-db")
 def init_db(admin: dict = Depends(verify_admin)):
     create_db_and_tables()
@@ -161,35 +183,8 @@ def init_db(admin: dict = Depends(verify_admin)):
 def get_stats(admin: dict = Depends(verify_admin), session: Session = Depends(get_session)):
     all_media = session.exec(select(Media)).all()
     total_views = sum([m.views for m in all_media])
-    images = [m for m in all_media if m.media_type == "image"]
-    gifs = [m for m in all_media if m.media_type == "gif"]
-    visible = len([m for m in all_media if m.visible])
-    hidden = len([m for m in all_media if not m.visible])
+    return {"total_media": len(all_media), "total_views": total_views}
 
-    categories = {}
-    for m in all_media:
-        c = categories.setdefault(m.category, {"total": 0, "images": 0, "gifs": 0})
-        c["total"] += 1
-        if m.media_type == "image":
-            c["images"] += 1
-        else:
-            c["gifs"] += 1
-
-    return {
-        "status": "ok",
-        "summary": {
-            "total_media": len(all_media),
-            "total_images": len(images),
-            "total_gifs": len(gifs),
-            "visible": visible,
-            "hidden": hidden,
-            "total_views": total_views,
-        },
-        "by_category": categories,
-        "allowed_categories": list(ALLOWED_CATEGORIES)
-    }
-
-# ---------- BULK UPLOAD ----------
 @app.post("/admin/bulk-upload", response_model=BulkUploadResponse)
 async def bulk_upload(
     files: List[UploadFile] = File(...),
@@ -244,127 +239,86 @@ async def bulk_upload(
 
     return BulkUploadResponse(success=len(uploaded), failed=len(errors), uploaded_media=uploaded, errors=errors)
 
-# ---------- HELPER: increment views ----------
-def increment_views(media: Media, session: Session):
-    media.views += 1
-    media.updated_at = datetime.utcnow()
-    session.add(media)
-    session.commit()
+# ---------- RANDOM ----------
+@app.get("/random/image", response_model=MediaOut)
+def random_image(session: Session = Depends(get_session)):
+    ids = session.exec(select(Media.id).where(Media.visible==True, Media.media_type=="image")).all()
+    if not ids: raise HTTPException(404, "No images available")
+    media = session.get(Media, random.choice(ids))
+    increment_views(media, session)
+    return media
+
+@app.get("/random/gif", response_model=MediaOut)
+def random_gif(session: Session = Depends(get_session)):
+    ids = session.exec(select(Media.id).where(Media.visible==True, Media.media_type=="gif")).all()
+    if not ids: raise HTTPException(404, "No gifs available")
+    media = session.get(Media, random.choice(ids))
+    increment_views(media, session)
+    return media
 
 # ---------- GET BY ID ----------
-@app.get("/media/{media_type}/{media_id}", response_model=MediaOut)
-def get_media_by_id(media_type: str, media_id: int, session: Session = Depends(get_session)):
-    if media_type not in ["image", "gif"]:
-        raise HTTPException(400, "media_type must be 'image' or 'gif'")
+@app.get("/image/{media_id}", response_model=MediaOut)
+def get_image(media_id: int, session: Session = Depends(get_session)):
     media = session.get(Media, media_id)
-    if not media or media.media_type != media_type or not media.visible:
-        raise HTTPException(404, f"{media_type.capitalize()} not found")
+    if not media or media.media_type != "image" or not media.visible:
+        raise HTTPException(404, "Image not found")
     increment_views(media, session)
     return media
 
-# ---------- RANDOM MEDIA ----------
-@app.get("/random/{media_type}", response_model=MediaOut)
-def random_media(media_type: str, session: Session = Depends(get_session)):
-    if media_type not in ["image", "gif"]:
-        raise HTTPException(400, "media_type must be 'image' or 'gif'")
-
-    ids = session.exec(select(Media.id).where(Media.visible == True, Media.media_type == media_type)).all()
-    if not ids:
-        raise HTTPException(404, f"No {media_type}s available")
-
-    random_id = random.choice(ids)
-    media = session.get(Media, random_id)
+@app.get("/gif/{media_id}", response_model=MediaOut)
+def get_gif(media_id: int, session: Session = Depends(get_session)):
+    media = session.get(Media, media_id)
+    if not media or media.media_type != "gif" or not media.visible:
+        raise HTTPException(404, "Gif not found")
     increment_views(media, session)
     return media
 
-# ---------- GET BY CATEGORY WITH PAGINATION ----------
-@app.get("/media/{media_type}/category/{category}", response_model=PaginatedMedia)
-def media_by_category(
-    media_type: str,
-    category: str,
-    page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
-    session: Session = Depends(get_session)
-):
-    if media_type not in ["image", "gif"]:
-        raise HTTPException(400, "media_type must be 'image' or 'gif'")
+# ---------- BY CATEGORY ----------
+@app.get("/images/category/{category}", response_model=PaginatedMedia)
+def images_by_category(category: str, page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
     category = validate_category(category)
+    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.category==category, Media.media_type=="image")).one()
+    total_items = total_items[0] if isinstance(total_items, tuple) else total_items
+    total_pages = (total_items + limit - 1)//limit
+    if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
+    offset = (page-1)*limit
+    items = session.exec(select(Media).where(Media.visible==True, Media.category==category, Media.media_type=="image").offset(offset).limit(limit)).all()
+    for m in items: increment_views(m, session)
+    return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
 
-    total_items = session.exec(
-        select(func.count(Media.id)).where(Media.visible == True, Media.media_type == media_type, Media.category == category)
-    ).one()
-    total_items = total_items[0] if isinstance(total_items, tuple) else total_items  # fix for tuple count
+@app.get("/gifs/category/{category}", response_model=PaginatedMedia)
+def gifs_by_category(category: str, page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
+    category = validate_category(category)
+    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.category==category, Media.media_type=="gif")).one()
+    total_items = total_items[0] if isinstance(total_items, tuple) else total_items
+    total_pages = (total_items + limit - 1)//limit
+    if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
+    offset = (page-1)*limit
+    items = session.exec(select(Media).where(Media.visible==True, Media.category==category, Media.media_type=="gif").offset(offset).limit(limit)).all()
+    for m in items: increment_views(m, session)
+    return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
 
-    total_pages = (total_items + limit - 1) // limit
-    if page > total_pages and total_pages > 0:
-        raise HTTPException(404, f"Page {page} does not exist")
-
-    offset = (page - 1) * limit
-    items = session.exec(
-        select(Media)
-        .where(Media.visible == True, Media.media_type == media_type, Media.category == category)
-        .offset(offset)
-        .limit(limit)
-    ).all()
-
-    for media in items:
-        increment_views(media, session)
-
-    return PaginatedMedia(
-        page=page,
-        limit=limit,
-        total_items=total_items,
-        total_pages=total_pages,
-        items=[MediaOut.model_validate(m) for m in items]
-    )
-
-# ---------- SEARCH WITH PAGINATION ----------
-@app.get("/search/{media_type}", response_model=PaginatedMedia)
-def search_media(
-    media_type: str,
-    q: str = Query(...),
-    page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
-    session: Session = Depends(get_session)
-):
-    if media_type not in ["image", "gif"]:
-        raise HTTPException(400, "media_type must be 'image' or 'gif'")
-
+# ---------- SEARCH ----------
+@app.get("/search/images", response_model=PaginatedMedia)
+def search_images(q: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
     pattern = f"%{q.lower()}%"
-    total_items = session.exec(
-        select(func.count(Media.id))
-        .where(Media.visible == True, Media.media_type == media_type, (Media.title.ilike(pattern)) | (Media.category.ilike(pattern)))
-    ).one()
-    total_items = total_items[0] if isinstance(total_items, tuple) else total_items  # fix for tuple count
+    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.media_type=="image", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern)))).one()
+    total_items = total_items[0] if isinstance(total_items, tuple) else total_items
+    total_pages = (total_items + limit - 1)//limit
+    if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
+    offset = (page-1)*limit
+    items = session.exec(select(Media).where(Media.visible==True, Media.media_type=="image", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))).offset(offset).limit(limit)).all()
+    for m in items: increment_views(m, session)
+    return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
 
-    total_pages = (total_items + limit - 1) // limit
-    if page > total_pages and total_pages > 0:
-        raise HTTPException(404, f"Page {page} does not exist")
-
-    offset = (page - 1) * limit
-    results = session.exec(
-        select(Media)
-        .where(Media.visible == True, Media.media_type == media_type, (Media.title.ilike(pattern)) | (Media.category.ilike(pattern)))
-        .offset(offset)
-        .limit(limit)
-    ).all()
-
-    for media in results:
-        increment_views(media, session)
-
-    return PaginatedMedia(
-        page=page,
-        limit=limit,
-        total_items=total_items,
-        total_pages=total_pages,
-        items=[MediaOut.model_validate(m) for m in results]
-    )
-
-# ---------- HEALTH ----------
-@app.get("/health")
-def health(session: Session = Depends(get_session)):
-    try:
-        session.exec(select(1))
-        return {"status": "ok", "database": "connected"}
-    except Exception as e:
-        return {"status": "error", "database": "disconnected", "error": str(e)}
+@app.get("/search/gifs", response_model=PaginatedMedia)
+def search_gifs(q: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), session: Session = Depends(get_session)):
+    pattern = f"%{q.lower()}%"
+    total_items = session.exec(select(func.count(Media.id)).where(Media.visible==True, Media.media_type=="gif", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern)))).one()
+    total_items = total_items[0] if isinstance(total_items, tuple) else total_items
+    total_pages = (total_items + limit - 1)//limit
+    if page>total_pages and total_pages>0: raise HTTPException(404, f"Page {page} does not exist")
+    offset = (page-1)*limit
+    items = session.exec(select(Media).where(Media.visible==True, Media.media_type=="gif", (Media.title.ilike(pattern)) | (Media.category.ilike(pattern))).offset(offset).limit(limit)).all()
+    for m in items: increment_views(m, session)
+    return PaginatedMedia(page=page, limit=limit, total_items=total_items, total_pages=total_pages, items=[MediaOut.model_validate(m) for m in items])
