@@ -7,3 +7,5 @@ python-dotenv
 PyJWT
 requests
 python-multipart
+mangum
+
